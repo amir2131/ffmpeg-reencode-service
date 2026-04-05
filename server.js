@@ -20,59 +20,60 @@ function authMiddleware(req, res, next) {
   next();
 }
 
-function safeUnlink(filePath) {
-  if (!filePath) return;
-  try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch (_) {}
-}
-
 app.get('/health', (req, res) => {
-  res.json({ ok: true });
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 app.post('/reencode', authMiddleware, upload.single('file'), async (req, res) => {
-  const inputFile = req.file?.path;
-  if (!inputFile) return res.status(400).json({ error: 'file is required' });
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
+  }
 
-  const targetVideoBitrate = req.body.target_video_bitrate || '3500k';
-  const targetAudioBitrate = req.body.target_audio_bitrate || '128k';
-  const targetFps = parseInt(req.body.target_fps || '30', 10);
-  const targetWidth = parseInt(req.body.target_width || '1080', 10);
-  const targetHeight = parseInt(req.body.target_height || '1920', 10);
-
-  const outputFile = path.join(os.tmpdir(), `output-${crypto.randomUUID()}.mp4`);
+  const inputPath = req.file.path;
+  const outputFilename = `reencoded_${crypto.randomBytes(8).toString('hex')}.mp4`;
+  const outputPath = path.join(os.tmpdir(), outputFilename);
 
   try {
     await new Promise((resolve, reject) => {
-      ffmpeg(inputFile)
+      ffmpeg(inputPath)
         .videoCodec('libx264')
         .audioCodec('aac')
         .outputOptions([
-          '-profile:v high', '-level 4.1', '-pix_fmt yuv420p',
-          `-r ${targetFps}`, `-b:v ${targetVideoBitrate}`,
-          '-maxrate 4000k', '-bufsize 7000k',
-          `-b:a ${targetAudioBitrate}`, '-ar 48000', '-movflags +faststart'
+          '-preset fast',
+          '-crf 23',
+          '-threads 1',
+          '-bufsize 4000k',
+          '-maxrate 2500k',
+          '-movflags +faststart',
+          '-y'
         ])
-        .videoFilters([
-          { filter: 'scale', options: { w: targetWidth, h: targetHeight, force_original_aspect_ratio: 'decrease' } },
-          { filter: 'pad', options: { w: targetWidth, h: targetHeight, x: '(ow-iw)/2', y: '(oh-ih)/2' } }
-        ])
-        .on('end', resolve)
-        .on('error', reject)
-        .save(outputFile);
+        .on('start', (cmd) => console.log('FFmpeg started:', cmd))
+        .on('progress', (progress) => console.log('Progress:', progress.percent, '%'))
+        .on('end', () => {
+          console.log('FFmpeg finished successfully');
+          resolve();
+        })
+        .on('error', (err) => {
+          console.error('FFmpeg error:', err.message);
+          reject(err);
+        })
+        .save(outputPath);
     });
 
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', 'attachment; filename="output.mp4"');
-    const stream = fs.createReadStream(outputFile);
-    stream.on('close', () => { safeUnlink(inputFile); safeUnlink(outputFile); });
-    stream.pipe(res);
-  } catch (error) {
-    safeUnlink(inputFile);
-    safeUnlink(outputFile);
-    res.status(500).json({ error: 'Re-encode failed', details: String(error?.message || error) });
+    res.download(outputPath, outputFilename, (err) => {
+      fs.unlink(inputPath, () => {});
+      fs.unlink(outputPath, () => {});
+      if (err && !res.headersSent) {
+        res.status(500).json({ error: 'Failed to send file' });
+      }
+    });
+  } catch (err) {
+    fs.unlink(inputPath, () => {});
+    fs.unlink(outputPath, () => {});
+    res.status(500).json({ error: 'Re-encoding failed', details: err.message });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`FFmpeg service running on port ${PORT}`);
+  console.log(`FFmpeg re-encode service running on port ${PORT}`);
 });
